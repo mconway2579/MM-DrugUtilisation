@@ -1,4 +1,4 @@
-#!/bin/bash
+# #!/bin/bash
 
 # Define the URL and output file name for CDC data
 URL="https://data.cdc.gov/api/views/7nwe-3aj9/rows.csv?accessType=DOWNLOAD"
@@ -39,3 +39,7 @@ for YEAR in {1991..2018}; do
     echo "Failed to download ${FILE_URL}."
   fi
 done
+
+
+wget -O "${DATA_DIR}/state-population.csv" \
+  "https://raw.githubusercontent.com/jakevdp/data-usstates/master/state-population.csv"
