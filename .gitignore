@@ -2,3 +2,4 @@ Data/
 *.zip
 *.csv
 *.png
+__pycache__/

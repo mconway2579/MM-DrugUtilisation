@@ -5,6 +5,7 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
+import seaborn as sns
 
 
 # Drug list (spelling hygiene + variants)
@@ -18,22 +19,16 @@ PLOTS_DIR = "/home/max/DrugUtil/results/plots"
 DATA_ROOT = "/home/max/DrugUtil/Data/"
 
 
-COMPRESS_SIMILARLY_NAMED_DRUGS = True  # Whether to compress similar drug names
 REQUIRED_YEARS = set(range(2008, 2019))  # Includes 2008 through 2018
-NORMALIZE_BY_POPULATION = True  # Whether to normalize prescription counts by state population
-SUBMEASURES = ['State Tax per pack', 'Average Cost per pack',
- 'Federal and State tax as a Percentage of Retail Price',
- 'Gross Cigarette Tax Revenue', 'Federal and State Tax per pack',
- 'Cigarette Consumption (Pack Sales Per Capita)']
 
 
-def read_data(path_to_csvs: str, load = True) -> pd.DataFrame:
+def read_data(path_to_csvs: str, load = True, compress_similarly_named_drugs = True) -> pd.DataFrame:
     """
     Read and merge drug utilization CSVs with CDC tax data.
     Returns a tidy table with: Year, State, Number of Prescriptions, percent_tax, dollar_tax.
     Caches the merged result as StateTaxDrugUtilizationData.csv in the same folder.
     """
-    super_file = os.path.join(path_to_csvs, "StateTaxDrugUtilizationData.csv")
+    super_file = os.path.join(path_to_csvs, f"StateTaxDrugUtilizationData_CompressedNames:{compress_similarly_named_drugs}.csv")
     if os.path.exists(super_file) and load:
          df = pd.read_csv(super_file, low_memory=False)
          print("Loaded cached data from", super_file)
@@ -62,7 +57,7 @@ def read_data(path_to_csvs: str, load = True) -> pd.DataFrame:
     pattern = "|".join([s for s in drugs_of_interest])
     mask = df["Product Name"].astype(str).str.contains(pattern, case=False, na=False)
     df_drug = df.loc[mask].copy()  # <-- make an explicit copy to avoid SettingWithCopy
-    if COMPRESS_SIMILARLY_NAMED_DRUGS:
+    if compress_similarly_named_drugs:
         matching_drugs = [
             [drug for drug in drugs_of_interest if drug.lower() in product_name.lower()]
             for product_name in df_drug["Product Name"]
@@ -181,39 +176,38 @@ def read_data(path_to_csvs: str, load = True) -> pd.DataFrame:
         ).reset_index(drop=True)
         print(f"Final data shape: {final_df.shape}")
 
-    if NORMALIZE_BY_POPULATION:
-        print("Normalizing Number of Prescriptions by state population...")
-        print(f"Before population normalization: {final_df.shape=}")
+    # --- NORMALIZE POPULATION ---
+    print("Normalizing Number of Prescriptions by state population...")
+    print(f"Before population normalization: {final_df.shape=}")
 
-        pop_path = os.path.join(path_to_csvs, "state-population.csv")
-        df_population = pd.read_csv(pop_path, low_memory=False)
+    pop_path = os.path.join(path_to_csvs, "state-population.csv")
+    df_population = pd.read_csv(pop_path, low_memory=False)
 
-        # keep only total-pop rows; standardize names
-        pop_df = df_population.rename(columns={
-            "state/region": "State",
-            "year": "Year"
-        })
-        # Drop all rows where ages is not 'total'
-        pop_df = pop_df[pop_df["ages"] == "total"]
+    # keep only total-pop rows; standardize names
+    pop_df = df_population.rename(columns={
+        "state/region": "State",
+        "year": "Year"
+    })
+    # Drop all rows where ages is not 'total'
+    pop_df = pop_df[pop_df["ages"] == "total"]
 
-        pop_df["Year"] = pd.to_numeric(pop_df["Year"], errors="raise")
-        pop_df["population"] = pd.to_numeric(pop_df["population"], errors="raise")
+    pop_df["Year"] = pd.to_numeric(pop_df["Year"], errors="raise")
+    pop_df["population"] = pd.to_numeric(pop_df["population"], errors="raise")
 
-        # Create a lookup dictionary for faster population lookups
-        pop_dict = {(row['Year'], row['State']): row['population'] 
-                    for _, row in pop_df.iterrows()}
+    # Create a lookup dictionary for faster population lookups
+    pop_dict = {(row['Year'], row['State']): row['population'] 
+                for _, row in pop_df.iterrows()}
 
-        # Iterate over rows of final_df and get corresponding population values
-        pops = []
-        for _, row in final_df.iterrows():
-            pop = pop_dict.get((row['Year'], row['State']), float('nan'))
-            pops.append(pop)
+    # Iterate over rows of final_df and get corresponding population values
+    pops = []
+    for _, row in final_df.iterrows():
+        pop = pop_dict.get((row['Year'], row['State']), float('nan'))
+        pops.append(pop)
 
-        pops = pd.Series(pops, index=final_df.index)
-        final_df["Number of Prescriptions"] = final_df["Number of Prescriptions"].astype(float) / pops
-        # Drop rows where population normalization resulted in NaN values
-        final_df = final_df.dropna(subset=["Number of Prescriptions"])
-        print(f"After population normalization: {final_df.shape=}")
+    pops = pd.Series(pops, index=final_df.index)
+    final_df["Number of Prescriptions Per Capita"] = final_df["Number of Prescriptions"].astype(float) / pops
+    # Drop rows where population normalization resulted in NaN values
+    print(f"After population normalization: {final_df.shape=}")
 
 
 
@@ -222,76 +216,143 @@ def read_data(path_to_csvs: str, load = True) -> pd.DataFrame:
 
 
 
-
-def plot_state_drug_pairs(df: pd.DataFrame):
+def analyze_correlations(df):
     """
-    Generates and saves a 3-panel plot for each unique State-Drug pair.
+    Analyzes and visualizes the correlation between prescription data and tax factors
+    for each unique product in the DataFrame.
 
-    Args:
-        df (pd.DataFrame): DataFrame with columns 'State', 'Product Name', 'Year',
-                           'Number of Prescriptions', 'dollar_tax', 'percent_tax'.
+    For each product, it:
+    1. Creates a dedicated output folder.
+    2. Calculates correlations and p-values between prescription numbers and tax factors.
+    3. Generates and saves separate bar charts for correlations and p-values.
     """
-    # Ensure the output directory exists
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    print(f"Saving plots to '{PLOTS_DIR}' directory...")
+    # --- Configuration ---
+    # Define the columns we want to analyze
+    prescription_metrics = [
+        'Number of Prescriptions',
+        'Number of Prescriptions Per Capita'
+    ]
+    tax_factors = [
+        'Federal and State Tax per pack',
+        'Federal and State tax as a Percentage of Retail Price',
+        'Gross Cigarette Tax Revenue',
+        'State Tax per pack',
+        'Cigarette Consumption (Pack Sales Per Capita)' # Added for broader analysis
+    ]
+    
+    # Get a list of unique product names from the DataFrame
+    unique_products = df['Product Name'].unique()
+    
+    print(f"Found {len(unique_products)} unique products. Starting analysis...")
 
-    pair_plot_dir = os.path.join(PLOTS_DIR, "state_drug_pairs")
-    os.makedirs(pair_plot_dir, exist_ok=True)
-
-    # Define a consistent set of years for the x-axis across all plots
-    years = sorted(df['Year'].unique())
-
-    # Group by state and drug, then iterate through each group
-    for (state, drug), group_df in df.groupby(['State', 'Product Name']):
-        print(f"  -> Generating plot for {state} - {drug}")
-
-        # Sort data by year for chronological plotting
-        group_df = group_df.sort_values('Year')
-
-        # --- Create the Plot ---
-        plt.figure(figsize=(15, 18))
-        plt.suptitle(f'Annual Data for {drug} in {state}', fontsize=20, fontweight='bold')
-
-        # 1) Prescriptions
-        plt.subplot(3, 1, 1)
-        plt.bar(group_df["Year"], group_df["Number of Prescriptions"], color="skyblue")
-        plt.ylabel("Number of Prescriptions")
-        plt.title("Number of Prescriptions")
-        plt.xticks(years, rotation=45)
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        # 2) Dollar tax
-        plt.subplot(3, 1, 2)
-        plt.bar(group_df["Year"], group_df["dollar_tax"], color="limegreen")
-        plt.ylabel("Tax ($)")
-        plt.title("Dollar Tax")
-        plt.xticks(years, rotation=45)
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        # 3) Percent tax
-        plt.subplot(3, 1, 3)
-        plt.bar(group_df["Year"], group_df["percent_tax"], color="salmon")
-        plt.xlabel("Year")
-        plt.ylabel("Tax (%)")
-        plt.title("Percent Tax")
-        plt.xticks(years, rotation=45)
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+    # --- Main Loop: Iterate over each product ---
+    for product in unique_products:
+        # Sanitize product name to create a valid folder name
+        folder_name = product.replace(' ', '_').replace('/', '_')
+        output_path = os.path.join('product_analysis', folder_name)
         
-        plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
+        # Create the directory for the product if it doesn't exist
+        os.makedirs(output_path, exist_ok=True)
+        
+        print(f"\nProcessing: {product} -> Saving results in '{output_path}'")
+        
+        # Filter the DataFrame to get data for the current product only
+        product_df = df[df['Product Name'] == product].copy()
+        
+        # --- Data Validation ---
+        if product_df.shape[0] < 3:
+            print(f"  - Skipping '{product}': insufficient data (less than 3 records).")
+            continue
+            
+        # --- Analysis Loop: Iterate over each prescription metric ---
+        for metric in prescription_metrics:
+            results = {
+                'Tax Factor': [],
+                'Correlation': [],
+                'P-Value': []
+            }
+            
+            if metric not in product_df.columns or product_df[metric].isnull().all():
+                print(f"  - Skipping metric '{metric}': column not found or all values are null.")
+                continue
 
-        # --- Save the Figure ---
-        # Sanitize drug name for filename (e.g., replace spaces)
-        safe_drug_name = drug.replace(' ', '_')
-        filename = f"{state}_{safe_drug_name}_Data.png"
-        output_path = os.path.join(pair_plot_dir, filename)
-        print(f"  -> Saving plot to {output_path}")
-        plt.savefig(output_path)
+            # --- Correlation Loop: Iterate over each tax factor ---
+            for factor in tax_factors:
+                if factor not in product_df.columns or product_df[factor].isnull().all():
+                    print(f"  - Skipping factor '{factor}': column not found or all values are null.")
+                    continue
 
-        # --- Close the plot to free memory ---
-        plt.close()
+                temp_df = product_df[[metric, factor]].dropna()
 
-    print("Finished generating all plots.")
+                if temp_df.shape[0] < 3:
+                    print(f"  - Skipping correlation for '{metric}' vs '{factor}': insufficient paired data.")
+                    correlation, p_value = np.nan, np.nan
+                else:
+                    try:
+                        correlation, p_value = pearsonr(temp_df[metric], temp_df[factor])
+                    except Exception as e:
+                        print(f"  - Could not calculate correlation for '{metric}' vs '{factor}': {e}")
+                        correlation, p_value = np.nan, np.nan
 
+                results['Tax Factor'].append(factor)
+                results['Correlation'].append(correlation)
+                results['P-Value'].append(p_value)
+
+            results_df = pd.DataFrame(results).dropna()
+
+            if results_df.empty:
+                print(f"  - No valid correlation results for '{metric}'. Skipping plots.")
+                continue
+
+            # --- Visualization ---
+            plt.style.use('seaborn-v0_8-whitegrid')
+            metric_title = metric.replace('_', ' ')
+            sample_size = product_df.shape[0]
+
+            # === PLOT 1: CORRELATION COEFFICIENTS ===
+            fig_corr, ax_corr = plt.subplots(figsize=(12, 8))
+            sns.barplot(x='Correlation', y='Tax Factor', data=results_df, palette='viridis', ax=ax_corr)
+            
+            for index, row in results_df.iterrows():
+                ax_corr.text(row['Correlation'] / 2, index, f"r = {row['Correlation']:.3f}", 
+                             color='white', ha='center', va='center', fontweight='bold')
+
+            ax_corr.set_title(f'Correlation of {metric_title}\nwith Tax & Economic Factors for {product} (N={sample_size})',
+                              fontsize=16, fontweight='bold')
+            ax_corr.set_xlabel('Pearson Correlation Coefficient (r)', fontsize=12)
+            ax_corr.set_ylabel('Tax & Economic Factor', fontsize=12)
+            ax_corr.axvline(x=0, color='black', linewidth=0.8, linestyle='--')
+            
+            plt.tight_layout()
+            plot_filename_corr = f"{metric.replace(' ', '_')}_correlation.png"
+            fig_corr.savefig(os.path.join(output_path, plot_filename_corr))
+            plt.close(fig_corr)
+            print(f"  - Successfully generated and saved plot: {plot_filename_corr}")
+
+            # === PLOT 2: P-VALUES ===
+            fig_p, ax_p = plt.subplots(figsize=(12, 8))
+            sns.barplot(x='P-Value', y='Tax Factor', data=results_df, palette='plasma', ax=ax_p)
+
+            for index, row in results_df.iterrows():
+                ax_p.text(row['P-Value'] / 2, index, f"r = {row['Correlation']:.3f}",
+                          color='white', ha='center', va='center', fontweight='bold')
+
+            ax_p.set_title(f'P-Values for Correlation of {metric_title}\nwith Tax Factors for {product} (N={sample_size})',
+                           fontsize=16, fontweight='bold')
+            ax_p.set_xlabel('P-Value', fontsize=12)
+            ax_p.set_ylabel('Tax & Economic Factor', fontsize=12)
+            # Add a line at p=0.05 for significance threshold
+            ax_p.axvline(x=0.05, color='red', linewidth=1.2, linestyle='--')
+            ax_p.text(0.051, ax_p.get_ylim()[1] * 0.95, 'p = 0.05', color='red', va='center')
+
+
+            plt.tight_layout()
+            plot_filename_p = f"{metric.replace(' ', '_')}_p_values.png"
+            fig_p.savefig(os.path.join(output_path, plot_filename_p))
+            plt.close(fig_p)
+            print(f"  - Successfully generated and saved plot: {plot_filename_p}")
+
+    print("\nAnalysis complete.")
 
 
 
@@ -299,7 +360,7 @@ def plot_state_drug_pairs(df: pd.DataFrame):
 
 if __name__ == "__main__":
     # Load & restrict to required columns
-    drug_df = read_data(DATA_ROOT, load = False)
+    drug_df = read_data(DATA_ROOT, compress_similarly_named_drugs=True)
     # print(f"Loaded {len(drug_df)} rows with {len(drug_df.columns)} columns.")
     # print(f"{drug_df['Year'].unique()} unique years found.")
     # print(f"{drug_df['State'].nunique()} unique states found.")
@@ -309,8 +370,7 @@ if __name__ == "__main__":
     # print(f"{drug_df['dollar_tax'].nunique()} unique dollar tax values found.")
 
 
-    # plot_state_drug_pairs(drug_df)
-
+    analyze_correlations(drug_df)
 
 
     
